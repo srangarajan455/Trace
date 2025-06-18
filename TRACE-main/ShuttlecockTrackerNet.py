@@ -6,30 +6,25 @@ import torch
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, pad, bias=True, bn=True):
         super().__init__()
+        layers = [
+            nn.Conv2d(in_channels, out_channels, kernel_size, padding=pad, bias=bias),
+            nn.ReLU(inplace=True)
+        ]
         if bn:
-            self.block = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size, padding=pad, bias=bias),
-                nn.ReLU(),
-                nn.BatchNorm2d(out_channels)
-            )
-        else:
-            self.block = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size, padding=pad, bias=bias),
-                nn.ReLU()
-            )
+            layers.append(nn.BatchNorm2d(out_channels))
+        self.block = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.block(x)
 
 class ShuttleTrackerNet(nn.Module):
     """
-    Deep network for shuttlecock detection (badminton)
+    Lightweight CNN model for detecting shuttlecock location in badminton videos.
     """
-    def __init__(self, out_channels=256, bn=True):
+    def __init__(self, out_channels=2, bn=True):
         super().__init__()
         self.out_channels = out_channels
 
-        # Encoder layers
         self.encoder = nn.Sequential(
             ConvBlock(9, 64, 3, 1, bn=bn),
             ConvBlock(64, 64, 3, 1, bn=bn),
@@ -46,7 +41,6 @@ class ShuttleTrackerNet(nn.Module):
             ConvBlock(512, 512, 3, 1, bn=bn)
         )
 
-        # Decoder layers
         self.decoder = nn.Sequential(
             nn.Upsample(scale_factor=2),
             ConvBlock(512, 256, 3, 1, bn=bn),
@@ -74,16 +68,19 @@ class ShuttleTrackerNet(nn.Module):
         return output
 
     def _init_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.uniform_(module.weight, -0.05, 0.05)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.BatchNorm2d):
-                nn.init.constant_(module.weight, 1)
-                nn.init.constant_(module.bias, 0)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
     def inference(self, frames: torch.Tensor):
+        """
+        Run inference on a 3-frame input tensor and get (x, y) position of shuttlecock.
+        """
         self.eval()
         with torch.no_grad():
             if len(frames.shape) == 3:
@@ -99,13 +96,13 @@ class ShuttleTrackerNet(nn.Module):
 
     def get_center_shuttle(self, output):
         """
-        Detect the center of the shuttlecock using connected component analysis
-        :param output: output from model (single channel heatmap)
-        :return: x, y coordinates of shuttlecock
+        Given model output, find the center of the shuttlecock using image moments.
         """
         output = output.reshape((360, 640)).astype(np.uint8)
         heatmap = cv2.resize(output, (640, 360))
-        ret, binary_map = cv2.threshold(heatmap, 127, 255, cv2.THRESH_BINARY)
+
+        # More aggressive filtering for fast-moving, small shuttlecock
+        _, binary_map = cv2.threshold(heatmap, 170, 255, cv2.THRESH_BINARY)
 
         contours, _ = cv2.findContours(binary_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -118,21 +115,3 @@ class ShuttleTrackerNet(nn.Module):
                 return cx, cy
 
         return None, None
-"""🔧 1. Upgrade Backbone
-Replace the VGG-style layers with MobileNetV3 or EfficientNet for speed + accuracy.
-
-🧠 2. Add Attention
-Use CBAM or SE blocks to help the model focus on the shuttlecock area.
-
-🎯 3. Heatmap Output
-Change final output to a single-channel heatmap instead of classification.
-
-Train with MSE loss on a 2D Gaussian centered on shuttlecock.
-
-🕒 4. Use Temporal Layers
-Instead of stacking 3 frames as input, try ConvLSTM or 3D CNN to capture motion better.
-
-⚡ 5. Post-Processing
-Add a Kalman Filter to smooth detections and reject outliers.
-
-Consider using Euclidean distance + velocity thresholding."""

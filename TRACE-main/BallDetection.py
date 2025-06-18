@@ -2,87 +2,110 @@ import numpy as np
 import cv2
 import torch
 from PIL import Image, ImageDraw
-
-from ShuttlecockTrackNet import ShuttlecockTrackerNet  # Make sure to retrain or fine-tune for badminton
+import ShuttlecockTrackerNet  # Make sure this is trained for badminton!
 
 def combine_three_frames(frame1, frame2, frame3, width, height):
-    # Resize and convert each frame to float32
+    """
+    Combines three frames into one 9-channel tensor for model input.
+    """
     img = cv2.resize(frame1, (width, height)).astype(np.float32)
     img1 = cv2.resize(frame2, (width, height)).astype(np.float32)
     img2 = cv2.resize(frame3, (width, height)).astype(np.float32)
-
-    # Concatenate images along depth (channel) axis: 3 x (H x W x 3) -> (H x W x 9)
     imgs = np.concatenate((img, img1, img2), axis=2)
-
-    # Rearrange axes for PyTorch (channels first)
-    imgs = np.rollaxis(imgs, 2, 0)
+    imgs = np.rollaxis(imgs, 2, 0)  # Channels first
     return np.array(imgs)
 
 class ShuttlecockDetector:
     """
-    Shuttlecock Detector using a lightweight CNN model for amateur badminton matches.
+    Shuttlecock Detector using a CNN model (modified TrackNet) for badminton.
+    Tracks shuttlecock positions across video frames.
     """
     def __init__(self, save_state, out_channels=2):
-        self.device = torch.device("cpu")
+        # Device setup
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # Load the trained model
         self.detector = ShuttlecockTrackerNet(out_channels=out_channels)
         saved_state_dict = torch.load(save_state, map_location=self.device)
         self.detector.load_state_dict(saved_state_dict['model_state'])
         self.detector.eval().to(self.device)
 
+        # Frame placeholders
         self.current_frame = None
         self.last_frame = None
         self.before_last_frame = None
 
+        # Video properties
         self.video_width = None
         self.video_height = None
 
-        # Resize model input size for better precision with small shuttlecock
+        # Input size to the model
         self.model_input_width = 720
         self.model_input_height = 480
 
-        # Reduced threshold since shuttle moves faster and covers more ground
+        # Detection threshold (distance between frames)
         self.threshold_dist = 60
 
+        # Tracking history
         self.xy_coordinates = np.array([[None, None]])
         self.bounces_indices = []
 
-    def detect_shuttlecock(self, frame):
+    def rescale_coordinates(self, x, y):
+        if x is None or y is None:
+            return None, None
+        x = int(x * (self.video_width / self.model_input_width))
+        y = int(y * (self.video_height / self.model_input_height))
+        return x, y
+
+    def get_smoothed_position(self, window=3):
+        coords = self.xy_coordinates[-window:]
+        valid = [c for c in coords if None not in c]
+        if not valid:
+            return None, None
+        return np.mean(valid, axis=0).astype(int)
+
+    def detect_shuttlecock(self, frame, show_debug=False):
         """
-        Detects shuttlecock position after receiving 3 consecutive frames.
-        :param frame: current frame
+        Detect shuttlecock using 3 consecutive frames.
+        :param frame: Current OpenCV frame
+        :param show_debug: If True, shows detection on screen
+        :return: (x, y) coordinates of detected shuttlecock (smoothed)
         """
         if self.video_width is None:
             self.video_width = frame.shape[1]
             self.video_height = frame.shape[0]
 
-        self.last_frame = self.before_last_frame
-        self.before_last_frame = self.current_frame
+        # Shift frame history
+        self.last_frame = self.before_last_frame or frame.copy()
+        self.before_last_frame = self.current_frame or frame.copy()
         self.current_frame = frame.copy()
 
-        if self.last_frame is not None:
-            # Prepare input tensor
-            frames = combine_three_frames(self.current_frame, self.before_last_frame, self.last_frame,
-                                          self.model_input_width, self.model_input_height)
-            frames = (torch.from_numpy(frames) / 255).to(self.device)
+        # Prepare input for the model
+        frames = combine_three_frames(self.current_frame, self.before_last_frame, self.last_frame,
+                                      self.model_input_width, self.model_input_height)
+        frames = (torch.from_numpy(frames) / 255.0).float().unsqueeze(0).to(self.device)
 
-            # Model prediction
+        # Predict position
+        with torch.no_grad():
             x, y = self.detector.inference(frames)
-            if x is not None:
-                # Rescale coordinates
-                x = int(x * (self.video_width / self.model_input_width))
-                y = int(y * (self.video_height / self.model_input_height))
 
-                # Outlier rejection based on speed
-                if self.xy_coordinates[-1][0] is not None:
-                    if np.linalg.norm(np.array([x, y]) - self.xy_coordinates[-1]) > self.threshold_dist:
-                        x, y = None, None
+        # Rescale to original resolution
+        x, y = self.rescale_coordinates(x, y)
 
-            self.xy_coordinates = np.append(self.xy_coordinates, np.array([[x, y]]), axis=0)
-            """Model retraining: The ShuttlecockTrackerNet must be trained on badminton footage, ideally with labeled shuttlecock positions.
+        # Optional outlier rejection
+        if self.xy_coordinates[-1][0] is not None:
+            if np.linalg.norm(np.array([x, y]) - self.xy_coordinates[-1]) > self.threshold_dist:
+                x, y = None, None
 
-            Higher frame rate videos: Shuttlecock movement is much faster than tennis. Use at least 60 fps videos.
+        # Store and smooth
+        self.xy_coordinates = np.append(self.xy_coordinates, np.array([[x, y]]), axis=0)
+        x_smooth, y_smooth = self.get_smoothed_position()
 
-            Smarter bounce detection: In badminton, shuttle bounces are rare (e.g., smashes or net shots that graze), so bounce detection might need to be replaced with landing detection (on court or not).
+        # Show debug view
+        if show_debug and x_smooth is not None and y_smooth is not None:
+            debug_frame = frame.copy()
+            cv2.circle(debug_frame, (x_smooth, y_smooth), 10, (0, 0, 255), -1)
+            cv2.imshow("Shuttlecock Detection", debug_frame)
+            cv2.waitKey(1)
 
-            Court boundary processing: Add morphological processing to check shuttlecock relative to court lines."""
+        return x_smooth, y_smooth
